@@ -1,0 +1,447 @@
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 81911e11a15d..5af5452f8b9a 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -28,6 +28,7 @@
+ #include <linux/bitops.h>
+ #include <linux/device.h>
+ #include <linux/nospec.h>
++#include <linux/mat.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/stacktrace.h>
+@@ -1505,7 +1506,14 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ 	ret = x86_pmu.handle_irq(regs);
+ 	finish_clock = sched_clock();
+ 
+-	perf_sample_event_took(finish_clock - start_clock);
++#ifdef MAT_PERF_NO_THROTTLING_FLAG
++	if(!gk_mat_perf_no_throttling)
++	{
++#endif /* MAT_PERF_NO_THROTTLING_FLAG */
++		perf_sample_event_took(finish_clock - start_clock);
++#ifdef MAT_PERF_NO_THROTTLING_FLAG
++	}
++#endif /* MAT_PERF_NO_THROTTLING_FLAG */
+ 
+ 	return ret;
+ }
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index 82dad001d1ea..98fa56eed2ef 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/export.h>
+ #include <linux/nmi.h>
++#include <linux/mat.h>
+ 
+ #include <asm/cpufeature.h>
+ #include <asm/hardirq.h>
+@@ -3194,6 +3195,16 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 			if (!(event->attr.sample_type &
+ 			      ~intel_pmu_large_pebs_flags(event)))
+ 				event->hw.flags |= PERF_X86_EVENT_LARGE_PEBS;
++#ifdef MAT_PERF_FORCE_LPEBS_FLAG
++			if( gk_mat_perf_force_lpebs )
++			{
++                /*
++                 * force the "large PEBS" configration
++                 * otherwise PMU signals interrupt after every PEBS event because (PEBS buffer size is set to 1)
++                 */
++				event->hw.flags |= PERF_X86_EVENT_LARGE_PEBS;
++			}
++#endif /* MAT_PERF_FORCE_LPEBS_FLAG */
+ 		}
+ 		if (x86_pmu.pebs_aliases)
+ 			x86_pmu.pebs_aliases(event);
+diff --git a/include/linux/mat.h b/include/linux/mat.h
+new file mode 100644
+index 000000000000..5008e7bd575e
+--- /dev/null
++++ b/include/linux/mat.h
+@@ -0,0 +1,83 @@
++#ifndef _LINUX_MAT_H
++#define _LINUX_MAT_H
++
++#include <linux/types.h>
++#include <linux/percpu.h>
++#include <linux/mat_config.h>
++
++/* macro for debug code */
++#ifdef MAT_KERNEL_DEBUG
++    #ifdef MAT_KERNEL_DEBUG_FLAG
++        #define MAT_KDBG(X) do { if (gk_mat_kernel_debug){X} } while(false)
++    #else /* MAT_KERNEL_DEBUG_FLAG */
++        #define MAT_KDBG(X) do { X } while(false)
++    #endif /* MAT_KERNEL_DEBUG_FLAG */
++#else /* MAT_KERNEL_DEBUG */
++    #define MAT_KDBG(X) do { } while(false)
++#endif /* MAT_KERNEL_DEBUG */
++
++/* macros for printing debug messages */
++#define MAT_KDBG_FUNC_RL(fmt, ...) MAT_KDBG( printk_ratelimited(KERN_INFO "MAT: %s %s @%d " fmt "\n", KBUILD_MODNAME, __func__, smp_processor_id(), ##__VA_ARGS__); )
++#define MAT_KDBG_FUNC(fmt, ...) MAT_KDBG( printk(KERN_INFO "MAT: %s %s @%d " fmt "\n", KBUILD_MODNAME, __func__, smp_processor_id(), ##__VA_ARGS__); )
++
++#ifdef MAT_KERNEL_DEBUG_FLAG
++extern int gk_mat_kernel_debug;
++#endif /* MAT_KERNEL_DEBUG_FLAG */
++
++#ifdef MAT_PERF_NO_THROTTLING_FLAG
++extern int gk_mat_perf_no_throttling;
++#endif /* MAT_PERF_NO_THROTTLING_FLAG */
++
++#ifdef MAT_PERF_FORCE_LPEBS_FLAG
++extern int gk_mat_perf_force_lpebs;
++#endif /* MAT_PERF_FORCE_LPEBS_FLAG */
++
++#ifdef MAT_GET_ADDR_FLAG
++extern int gk_mat_get_addr;
++#endif /* MAT_GET_ADDR_FLAG */
++
++#ifdef MAT_PHYS_ADDR_FLAG
++extern int gk_mat_phys_addr;
++#endif /* MAT_PHYS_ADDR_FLAG */
++
++#ifdef MAT_ADDR_RANGE_COUNTERS
++/*
++ * counts #samples per address ranges for every logical core
++ * align to cache line to avoid false sharing
++ */
++struct mat_range_cnt
++{
++    u64 cnts[6];
++};
++DECLARE_PER_CPU_SHARED_ALIGNED(struct mat_range_cnt, cpu_mat_range_cnts);
++
++/* map address to [0,5] */
++int mat_addr_range( u64 addr );
++#endif /* MAT_ADDR_RANGE_COUNTERS */
++
++#ifdef MAT_ADDR_BUFFERS
++extern int gk_mat_buffers_enabled;
++
++struct mat_buffer
++{
++    u64* data;
++    u64  size;
++    u64  capacity;
++};
++
++/* number of buffers per core must be power of 2 */
++#define MAT_BUF_NUM (1 << 1)
++#define MAT_BUF_IDX_MASK (MAT_BUF_NUM-1)
++struct mat_buffers
++{
++    /* index of currently active buffer */
++    u32 buf_idx;
++    struct mat_buffer buffers[MAT_BUF_NUM];
++};
++u32 mat_buffers_next_index(u32 buf_idx);
++int mat_buffers_insert(struct mat_buffers* bufs, u64 addr);
++
++DECLARE_PER_CPU_SHARED_ALIGNED(struct mat_buffers, cpu_mat_buffers);
++#endif /* MAT_ADDR_BUFFERS */
++
++#endif /* _LINUX_MAT_H */
+diff --git a/include/linux/mat_config.h b/include/linux/mat_config.h
+new file mode 100644
+index 000000000000..8da27ae09bab
+--- /dev/null
++++ b/include/linux/mat_config.h
+@@ -0,0 +1,41 @@
++#ifndef _LINUX_MAT_CONFIG_H
++#define _LINUX_MAT_CONFIG_H
++
++/* add debug code to kernel */
++#define MAT_KERNEL_DEBUG
++/* add flag to enable/disable debug code at run time */
++#define MAT_KERNEL_DEBUG_FLAG
++/* add flag to enable/disable throttling of interrupts at run time */
++#define MAT_PERF_NO_THROTTLING_FLAG
++/* force large PEBS mode */
++#define MAT_PERF_FORCE_LPEBS_FLAG
++/* retrieve address field of every sample; do not write to ring buffer */
++#define MAT_GET_ADDR
++/* add flag to enable/disable retrieving address at run time */
++#define MAT_GET_ADDR_FLAG
++/* add flag to enable/disable retrieving physical address at run time */
++#define MAT_PHYS_ADDR_FLAG
++/* use per-core counter to count address ranges */
++#define MAT_ADDR_RANGE_COUNTERS
++/* use per-core buffer to store addresses */
++#define MAT_ADDR_BUFFERS
++
++
++
++#if defined(MAT_KERNEL_DEBUG_FLAG) && !defined(MAT_KERNEL_DEBUG)
++    #error "MAT_KERNEL_DEBUG_FLAG needs MAT_KERNEL_DEBUG"
++#endif
++#if defined(MAT_GET_ADDR_FLAG) && !defined(MAT_GET_ADDR)
++    #error "MAT_GET_ADDR_FLAG needs MAT_GET_ADDR"
++#endif
++#if defined(MAT_PHYS_ADDR_FLAG) && !defined(MAT_GET_ADDR_FLAG)
++    #error "MAT_PHYS_ADDR_FLAG needs MAT_GET_ADDR_FLAG"
++#endif
++#if defined(MAT_ADDR_RANGE_COUNTERS) && !defined(MAT_GET_ADDR)
++    #error "MAT_ADDR_RANGE_COUNTERS needs MAT_GET_ADDR"
++#endif
++#if defined(MAT_ADDR_BUFFERS) && !defined(MAT_GET_ADDR)
++    #error "MAT_ADDR_BUFFERS needs MAT_GET_ADDR"
++#endif
++
++#endif /* _LINUX_MAT_CONFIG_H */
+diff --git a/kernel/events/Makefile b/kernel/events/Makefile
+index 3c022e33c109..6c89353c036a 100644
+--- a/kernel/events/Makefile
++++ b/kernel/events/Makefile
+@@ -3,7 +3,7 @@ ifdef CONFIG_FUNCTION_TRACER
+ CFLAGS_REMOVE_core.o = $(CC_FLAGS_FTRACE)
+ endif
+ 
+-obj-y := core.o ring_buffer.o callchain.o
++obj-y := core.o ring_buffer.o callchain.o mat.o
+ 
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT) += hw_breakpoint.o
+ obj-$(CONFIG_UPROBES) += uprobes.o
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index dc7dead2d2cc..f0d43180f9d9 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -49,6 +49,7 @@
+ #include <linux/sched/mm.h>
+ #include <linux/proc_ns.h>
+ #include <linux/mount.h>
++#include <linux/mat.h>
+ 
+ #include "internal.h"
+ 
+@@ -6537,6 +6538,70 @@ void perf_prepare_sample(struct perf_event_header *header,
+ 		data->phys_addr = perf_virt_to_phys(data->addr);
+ }
+ 
++#ifdef MAT_GET_ADDR
++void mat_process_addr(struct perf_sample_data *data)
++{
++	u64 addr;
++#ifdef MAT_PHYS_ADDR_FLAG
++	/* either retrieve physical or virtual memory address */
++	if(gk_mat_phys_addr)
++	{
++		/*
++         * retrieve physical memory address from perf sample
++         * data->phys_addr is set in perf_prepare_sample but
++         * because perf_prepare_sample is not called before
++         * we need to get physical address by calling perf_virt_to_phys
++         */
++		addr = perf_virt_to_phys(data->addr);
++	}
++    else
++#endif /* MAT_PHYS_ADDR_FLAG */
++    {
++        /* retrieve virtual memory address from perf sample */
++	    addr = data->addr;
++    }
++
++	/*
++	 * TODO: get timestamp of sampled memory address
++	 * needs PEBS v3 ( >= Broadwell) to get TSC value from hardware as part of PEBS record format
++     * u64 time = data->time;
++	 */
++
++#if defined(MAT_ADDR_RANGE_COUNTERS) && !defined(MAT_ADDR_BUFFERS)
++	{
++		int cpu = get_cpu();
++		struct mat_range_cnt* rcnt = per_cpu_ptr(&cpu_mat_range_cnts, cpu);
++		// struct mat_range_cnt* rcnt = this_cpu_ptr(&cpu_mat_range_cnts);
++		rcnt->cnts[mat_addr_range(addr)]++;
++		put_cpu();
++	}
++#elif !defined(MAT_ADDR_RANGE_COUNTERS) && defined(MAT_ADDR_BUFFERS)
++	if(gk_mat_buffers_enabled)
++	{
++		/* get_cpu() disables preemption, put_cpu() enables preemption */
++		int cpu = get_cpu();
++		struct mat_buffers* bufs = per_cpu_ptr(&cpu_mat_buffers, cpu);
++		// struct mat_buffers* bufs = this_cpu_ptr(&cpu_mat_buffers);
++		mat_buffers_insert(bufs, addr);
++		put_cpu();
++	}
++#elif defined(MAT_ADDR_RANGE_COUNTERS) && defined(MAT_ADDR_BUFFERS)
++	{
++		int cpu = get_cpu();
++		struct mat_range_cnt* rcnt = per_cpu_ptr(&cpu_mat_range_cnts, cpu);
++		rcnt->cnts[mat_addr_range(addr)]++;
++		if(gk_mat_buffers_enabled)
++		{
++			struct mat_buffers* bufs = per_cpu_ptr(&cpu_mat_buffers, cpu);
++			// struct mat_buffers* bufs = this_cpu_ptr(&cpu_mat_buffers);
++			mat_buffers_insert(bufs, addr);
++		}
++		put_cpu();
++	}
++#endif /* MAT_ADDR_BUFFERS, MAT_ADDR_RANGE_COUNTERS */
++}
++#endif /* MAT_GET_ADDR */
++
+ static __always_inline int
+ __perf_event_output(struct perf_event *event,
+ 		    struct perf_sample_data *data,
+@@ -6549,6 +6614,17 @@ __perf_event_output(struct perf_event *event,
+ 	struct perf_event_header header;
+ 	int err;
+ 
++#ifdef MAT_GET_ADDR
++	/* get perf sample and process; do not write to ringbuffer */
++#ifdef MAT_GET_ADDR_FLAG
++	if( gk_mat_get_addr )
++#endif /* MAT_GET_ADDR_FLAG */
++	{
++		mat_process_addr(data);
++		return 0;
++	}
++#endif /* MAT_GET_ADDR */
++
+ 	/* protect the callchain buffers */
+ 	rcu_read_lock();
+ 
+@@ -10752,6 +10828,33 @@ SYSCALL_DEFINE5(perf_event_open,
+ 	if (err)
+ 		return err;
+ 
++#ifdef MAT_PHYS_ADDR_FLAG
++	/*
++	 * make sure that if we want to sample physical address
++	 * PERF_SAMPLE_PHYS_ADDR is set and
++	 * PERF_SAMPLE_ADDR is NOT set
++     *
++	 * do this check only if perf uses syscall to initiate profiling
++     * (and not to test if event configuration is valid)
++	 * if perf uses syscall to check event configuration, this seems to be true:
++	 * attr.type == PERF_TYPE_SOFTWARE or attr.config == {0x0,0x1}
++	 */
++	if(gk_mat_get_addr && gk_mat_phys_addr &&
++	   attr.type != PERF_TYPE_SOFTWARE && attr.config != 0x0 && attr.config != 0x1)
++	{
++		if( !(attr.sample_type & PERF_SAMPLE_PHYS_ADDR) )
++		{
++			MAT_KDBG_FUNC("gk_mat_phys_addr=%d but PERF_SAMPLE_PHYS_ADDR=%x not set",gk_mat_phys_addr, PERF_SAMPLE_PHYS_ADDR);
++			return -EINVAL;
++		}
++		if( (attr.sample_type & PERF_SAMPLE_PHYS_ADDR) && (attr.sample_type & PERF_SAMPLE_ADDR) )
++		{
++			MAT_KDBG_FUNC("gk_mat_phys_addr=%d and PERF_SAMPLE_PHYS_ADDR=%x set but PERF_SAMPLE_ADDR=%x set as well. we do not support both", gk_mat_phys_addr, PERF_SAMPLE_PHYS_ADDR, PERF_SAMPLE_ADDR);
++			return -EINVAL;
++		}
++	}
++#endif /* MAT_PHYS_ADDR_FLAG */
++
+ 	if (!attr.exclude_kernel) {
+ 		if (perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN))
+ 			return -EACCES;
+diff --git a/kernel/events/mat.c b/kernel/events/mat.c
+new file mode 100644
+index 000000000000..e06eac817dcd
+--- /dev/null
++++ b/kernel/events/mat.c
+@@ -0,0 +1,100 @@
++#include <linux/mat.h>
++#include <linux/module.h>
++
++/*
++ * export symbols with EXPORT_SYMBOL_GPL to make them visible
++ * in kernel modules (GPL license)
++ * needs MODULE_LICENSE("GPL") in kernel module
++ */
++
++#ifdef MAT_KERNEL_DEBUG_FLAG
++int gk_mat_kernel_debug __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_kernel_debug);
++#endif /* MAT_KERNEL_DEBUG_FLAG */
++
++#ifdef MAT_PERF_NO_THROTTLING_FLAG
++int gk_mat_perf_no_throttling __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_perf_no_throttling);
++#endif /* MAT_PERF_NO_THROTTLING_FLAG */
++
++#ifdef MAT_PERF_FORCE_LPEBS_FLAG
++int gk_mat_perf_force_lpebs __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_perf_force_lpebs);
++#endif /* MAT_PERF_FORCE_LPEBS_FLAG */
++
++#ifdef MAT_GET_ADDR_FLAG
++int gk_mat_get_addr __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_get_addr);
++#endif /* MAT_GET_ADDR_FLAG */
++
++#ifdef MAT_PHYS_ADDR_FLAG
++int gk_mat_phys_addr __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_phys_addr);
++#endif /* MAT_PHYS_ADDR_FLAG */
++
++#ifdef MAT_ADDR_RANGE_COUNTERS
++DEFINE_PER_CPU_SHARED_ALIGNED(struct mat_range_cnt, cpu_mat_range_cnts);
++EXPORT_PER_CPU_SYMBOL_GPL(cpu_mat_range_cnts);
++#endif /* MAT_ADDR_RANGE_COUNTERS */
++
++#if defined(MAT_ADDR_RANGE_COUNTERS) || defined(MAT_ADDR_HASH_TABLE)
++__always_inline int mat_addr_range( u64 addr )
++{
++    return (addr > 0x0) +
++           (addr > 0x40000000) +
++           (addr > 0x7d0000000000) +
++           (addr > 0x7ff000000000) +
++           (addr > 0xfff000000000000);
++}
++EXPORT_SYMBOL_GPL(mat_addr_range);
++#endif /* MAT_ADDR_RANGE_COUNTERS || MAT_ADDR_HASH_TABLE */
++
++
++
++#ifdef MAT_ADDR_BUFFERS
++int gk_mat_buffers_enabled __read_mostly = 0;
++EXPORT_SYMBOL_GPL(gk_mat_buffers_enabled);
++
++DEFINE_PER_CPU_SHARED_ALIGNED(struct mat_buffers, cpu_mat_buffers);
++EXPORT_PER_CPU_SYMBOL_GPL(cpu_mat_buffers);
++
++/* increment index by 1, modulo number of buffers; number of buffers need to be power of 2 */
++__always_inline u32 mat_buffers_next_index(u32 buf_idx)
++{
++	return (buf_idx + 1) & MAT_BUF_IDX_MASK;
++}
++
++__always_inline int mat_buffers_insert(struct mat_buffers* bufs, u64 addr)
++{
++	struct mat_buffer* buf;
++	u32 initial_idx = bufs->buf_idx;
++
++	/* lots of addresses (on Haswell) are 0x0. skip these. */
++	if(addr == 0)
++	{
++		return 0;
++	}
++
++try_insert:
++	buf = &(bufs->buffers[bufs->buf_idx]);
++	/* try to insert in current buffer */
++	if(buf->size < buf->capacity)
++	{
++		buf->data[buf->size] = addr;
++		buf->size           += 1;
++		return 0;
++	}
++	/* otherwise try to find another buffer */
++	else
++	{
++		bufs->buf_idx = mat_buffers_next_index(bufs->buf_idx);
++		/* we tried all buffers, abort inserting */
++		if( bufs->buf_idx != initial_idx )
++		{
++			goto try_insert;
++		}
++	}
++	return -1;
++}
++#endif /* MAT_ADDR_BUFFERS */
++
